@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import db, report, search
+from . import db, report, search, verify
 from .reassembly import LIMIT, PublishRejected, RevisionConflict
 from .report import (
     DEFAULT_MAX_BYTES,
@@ -30,6 +30,7 @@ from .schemas import (
     RevisionMeta,
     SessionResponse,
     UploadRequest,
+    VerifyResponse,
 )
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.getcwd(), "data", "reassembly.db"))
@@ -47,10 +48,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TCP 会话重组 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按会话/方向接收乱序报文，以唯一 SYN 为锚发布修订并分页重组，"
-        "并支持在指定修订的双份字节流上做字节特征定位。"
+        "支持在指定修订的双份字节流上做字节特征定位，"
+        "并用对端 ACK/SACK 核验修订缺口（已确认但未捕获 / 无确认依据）。"
     ),
     lifespan=lifespan,
 )
@@ -88,6 +90,40 @@ def _resolve_revision(conn, session_id: str, direction: str, revision: str) -> i
         return int(revision)
     except ValueError:
         raise HTTPException(400, detail="revision 必须是整数或 'latest'")
+
+
+def _validate_ack_sack(p) -> tuple[int | None, list[list[int]]]:
+    """报文级 ACK/SACK 语义校验，返回 (ack, sack)；非法 → 422。
+
+    旧格式（ack 缺省、sack 缺省）直接放行；带非空 SACK 必须带 ACK；
+    SACK 半开块必须 left<right（32 位回绕块由核验时按窗口忽略）。
+    """
+    blocks: list[list[int]] = []
+    if p.sack:
+        if p.ack is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "sack_without_ack",
+                    "capture": p.capture,
+                    "message": f"capture={p.capture} 带 SACK 的报文必须同时提供 32 位 ack",
+                },
+            )
+        for blk in p.sack:
+            if blk.left >= blk.right:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "invalid_sack",
+                        "capture": p.capture,
+                        "message": (
+                            f"capture={p.capture} 的 SACK 块 [{blk.left},{blk.right})"
+                            " 非法：半开块必须满足 left<right"
+                        ),
+                    },
+                )
+            blocks.append([blk.left, blk.right])
+    return p.ack, blocks
 
 
 def _decode_pattern(pattern_b64: str) -> bytes:
@@ -183,8 +219,9 @@ def upload_packets(session_id: str, direction: str, body: UploadRequest,
                         "message": f"capture={p.capture} 的 payload 不是合法 Base64",
                     },
                 )
+            ack, sack = _validate_ack_sack(p)
             decoded.append((p.capture, p.seq, 1 if p.syn else 0,
-                            1 if p.fin else 0, raw))
+                            1 if p.fin else 0, raw, ack, sack))
         try:
             db.add_packets(conn, session_id, direction, decoded)
         except RevisionConflict as exc:
@@ -330,5 +367,28 @@ def locate_pattern(session_id: str, direction: str, revision: str,
         if page is None:
             raise HTTPException(404, detail=f"修订 {rev} 不存在")
         return page
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/sessions/{session_id}/directions/{direction}/revisions/{revision}/verify",
+    response_model=VerifyResponse,
+)
+def verify_gaps(session_id: str, direction: str, revision: str, request: Request):
+    """对端确认缺口核验：以目标修订的 SYN 锚换算请求时已入库的反向 ACK/SACK，
+
+    把确认覆盖与修订冻结的缺口求交，返回“已确认但未捕获”与“无确认依据”区间。
+    确认集合请求时重算（晚到证据会更新核验），修订报告/定位不随之变化。
+    """
+    _check_direction(direction)
+    conn = get_conn(request)
+    try:
+        _require_session(conn, session_id)
+        rev = _resolve_revision(conn, session_id, direction, revision)
+        result = verify.build_verification(conn, session_id, direction, rev)
+        if result is None:
+            raise HTTPException(404, detail=f"修订 {rev} 不存在")
+        return result
     finally:
         conn.close()

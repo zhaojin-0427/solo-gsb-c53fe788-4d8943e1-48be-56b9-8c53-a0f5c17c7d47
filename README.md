@@ -8,6 +8,11 @@
 在其中定位任意 Base64 字节特征，返回按逻辑偏移排序的命中起点、下一页起点和
 `both / earliest_only / latest_only` 双侧命中类别，支持重叠命中与跨 run 命中。
 
+还提供**对端确认缺口核验 API**（`GET .../revisions/{rev}/verify`）：上传报文可携带 32 位
+**ACK** 与 **SACK** 半开块（旧格式报文照常可用），以**目标修订冻结的 SYN 锚**换算
+**请求时已入库的反向** ACK/SACK，与修订缺口求交，返回**“已确认但未捕获”**
+（`acknowledged_gaps`）与**“无确认依据”**（`unacknowledged_gaps`，不等于未送达）两类区间。
+
 报文可以**任意乱序上传**（先传数据、后传 SYN 也可以），结果只取决于全部报文的内容，与上传顺序无关。
 
 ---
@@ -35,7 +40,7 @@ DB_PATH=./data/reassembly.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试与压测
 
 ```bash
-python3 -m pytest -q            # 35 个功能/HTTP 测试（含字节特征定位 12 例）
+python3 -m pytest -q            # 58 个功能/HTTP 测试（定位 12 例 + 对端确认核验 23 例）
 python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口的内存压测
 ```
 
@@ -75,7 +80,7 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
   不一致返回 **409**，并在 `current_revision` 中给出**当前修订号**。
 - **更晚到达、但 capture 更小的报文**：发布后产生一个**继承全部旧报文**的新修订（新数据并入重算），
   **旧修订报告保持不变**。
-- 同一方向同一 `capture` 的报文若再次上传：整条内容（seq/SYN/FIN/载荷）一致则幂等忽略；
+- 同一方向同一 `capture` 的报文若再次上传：整条内容（seq/SYN/FIN/载荷/ACK/SACK）一致则幂等忽略；
   任一不同则 **409 capture_conflict**。
 
 ---
@@ -92,6 +97,7 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}` | 修订元信息（`rev` 可为整数或 `latest`） |
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}/report` | 分页重组报告 |
 | POST | `/sessions/{id}/directions/{dir}/revisions/{rev}/locate` | 字节特征定位（跨 run、双侧分类、分页） |
+| GET | `/sessions/{id}/directions/{dir}/revisions/{rev}/verify` | 对端确认缺口核验（反向 ACK/SACK 与修订缺口求交） |
 
 `{dir}` ∈ `c2s`、`s2c`。报告查询参数：`offset`（默认 1，∈[1,2^31]）、
 `max_bytes`（默认 65536，硬上限 4 MiB）、`max_runs`（默认 2000，硬上限 20000）。
@@ -133,6 +139,51 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
 ```
 
 `payload` 为标准 Base64（空载荷用 `""`）。非法 Base64 返回 422。
+
+报文还可携带对端确认字段（**均可选；省略即为旧格式报文，行为不变**）：
+
+```json
+{ "capture": 11, "seq": 7001, "ack": 1004,
+  "sack": [ {"left": 1005, "right": 1007} ] }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `ack` | 32 位确认号（`0..2^32-1`）。同捕获序号再传但 ACK/SACK 内容不同 → **409 `capture_conflict`** |
+| `sack` | SACK 半开块列表，每块 `{"left","right"}` 为 32 位序号、`[left,right)`，最多 32 块；**带 SACK 必须同时带 `ack`**，否则 **422 `sack_without_ack`**；空块/`left>=right` → **422 `invalid_sack`** |
+
+### 对端确认缺口核验 `GET .../verify`
+
+以路径中**目标方向的目标修订**为准（`{rev}` 支持整数与 `latest`，未知修订 **404**），
+取该修订冻结的 **SYN 锚（ISN）与缺口**，把**请求时已入库的反向报文**
+（核验 `c2s` 时读 `s2c`，反之亦然）中的 ACK/SACK 换算为逻辑偏移：
+
+- **累计 ACK**：窗口内最大的 ACK 相对偏移 `cum`，覆盖 `[1, cum)`；重复或倒序 ACK 不重复计数
+  （并列最大取最晚捕获的报文为来源）。
+- **SACK**：每块**只覆盖各自半开区间**，重叠/相邻块合并、来源去重；
+  **绝不能把 SACK 上界当作累计确认**。块与 `[1,cum)` 重叠的部分不重复计为 SACK。
+- **半序号窗口**：相对偏移必须落在 `[0, 2^31]`；ACK 越窗则**整条证据（含其 SACK）忽略**，
+  SACK 块越窗部分裁剪、换算后回绕（相对 `left>=right`）整块丢弃，数量计入 `ignored_outside_window`。
+- 确认覆盖与冻结缺口求交：
+  - `acknowledged_gaps` —— **已确认但未捕获**：缺口内被累计 ACK 或 SACK 覆盖的区间；
+  - `unacknowledged_gaps` —— **无确认依据**：缺口内没有任何确认覆盖的部分，
+    **只代表没有确认依据，不等于数据未送达**。
+- **纯 SYN/FIN 无载荷**：若 FIN 前没有捕获到任何数据行程（如纯 FIN 落在偏移 4），
+  FIN 前 `[1, fin_pos)` 全部作为缺口参与核验。
+
+**时效性**：确认集合在**请求时重算**——晚到的反向 ACK/SACK 入库后再次请求即可看到核验更新，
+无需重新发布；而修订的 run、缺口、**报告与定位全部随修订冻结，不随确认证据变化**。
+
+响应字段：
+
+| 字段 | 说明 |
+|---|---|
+| `isn` / `gaps` / `fin_pos` | 目标修订冻结的 SYN 锚、缺口区间、FIN 位置 |
+| `cumulative_ack.offset` / `.source` | 最大累计确认偏移（0 表示未确认数据）及其来源报文（`packet_id/capture/ack`） |
+| `sack_blocks[]` | 合并后超出累计确认的 SACK 覆盖块 `start/end` 与全部来源 `sources` |
+| `acknowledged_gaps` | 已确认但未捕获区间（相邻但依据不同的区间保持分段） |
+| `unacknowledged_gaps` | 无确认依据区间（**不等于未送达**） |
+| `ignored_outside_window` | 落在半序号窗口外被忽略的确认证据数 |
 
 ---
 
@@ -524,10 +575,137 @@ curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
 
 ---
 
+### 4.8 对端确认缺口核验：ACK / SACK 与修订缺口求交
+
+会话 `ackdemo`：c2s 以 ISN=1000 锚定，`AB` 在偏移 1、`CD` 在偏移 5，FIN 在偏移 7，
+发布修订 1 后冻结唯一缺口 **`[3,5)`**（`fin_pos=7`、`complete=false`）。
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' \
+  -d '{"session_id":"ackdemo"}'
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/c2s/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":1,"seq":1000,"syn":true},
+                  {"capture":2,"seq":1001,"payload":"QUI="},
+                  {"capture":3,"seq":1005,"payload":"Q0Q="},
+                  {"capture":4,"seq":1007,"fin":true}]}'
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/c2s/revisions \
+  -H 'Content-Type: application/json' -d '{"expected_revision":0}'
+# {"revision":1,"isn":1000,"fin_pos":7,"complete":false,"run_count":2,"gaps":[[3,5]]}
+```
+
+**反向（s2c）尚无确认证据**时，整个缺口都属于“无确认依据”（注意：不等于未送达）：
+
+```bash
+curl -s localhost:8000/sessions/ackdemo/directions/c2s/revisions/1/verify
+```
+```json
+{"session_id":"ackdemo","direction":"c2s","revision":1,"isn":1000,"fin_pos":7,
+ "gaps":[[3,5]],
+ "cumulative_ack":{"offset":0,"source":null},"sack_blocks":[],
+ "acknowledged_gaps":[],"unacknowledged_gaps":[[3,5]],
+ "ignored_outside_window":0,
+ "note":"unacknowledged_gaps 仅表示缺口缺少确认依据，不等于未送达；确认集合按请求时已入库的反向报文重算，晚到证据会更新本核验，修订报告与定位不随之变化"}
+```
+
+上传反向报文：capture=10 的 `ack=1004`（相对偏移 4，累计覆盖 `[1,4)`），
+capture=11 重复同一 ACK 并带 SACK 块 `[1005,1007)`（缺口外），
+capture=12 是更小的倒序 ACK=1002（不重复计数、不改变累计值）：
+
+```bash
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":10,"seq":7000,"syn":true,"ack":1004},
+                  {"capture":11,"seq":7001,"ack":1004,
+                   "sack":[{"left":1005,"right":1007}]},
+                  {"capture":12,"seq":7002,"ack":1002}]}'
+curl -s localhost:8000/sessions/ackdemo/directions/c2s/revisions/1/verify
+```
+```json
+{
+  "revision": 1, "isn": 1000, "fin_pos": 7, "gaps": [[3, 5]],
+  "cumulative_ack": {"offset": 4,
+    "source": {"packet_id": 6, "capture": 11, "ack": 1004}},
+  "sack_blocks": [{"start": 5, "end": 7,
+    "sources": [{"packet_id": 6, "capture": 11, "ack": 1004}]}],
+  "acknowledged_gaps": [[3, 4]],
+  "unacknowledged_gaps": [[4, 5]],
+  "ignored_outside_window": 0
+}
+```
+
+累计 ACK 与缺口交在 `[3,4)`（已确认但未捕获），`[4,5)` 仍无确认依据；
+SACK 块 `[5,7)` 落在缺口外、其上界 7 **没有**被当成累计确认。
+
+**晚到证据即时更新核验，无需重新发布**：随后到达 capture=13，`ack=1005`（覆盖到 5）
+并 SACK `[1004,1005)`，再请求同一修订：缺口全部转为已确认；
+而同修订的**报告缺口与字节保持冻结不变**：
+
+```bash
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":13,"seq":7003,"ack":1005,
+                   "sack":[{"left":1004,"right":1005}]}]}'
+curl -s localhost:8000/sessions/ackdemo/directions/c2s/revisions/1/verify
+# "cumulative_ack":{"offset":4 -> 5,...},"acknowledged_gaps":[[3,5]],
+# "unacknowledged_gaps":[]
+curl -s localhost:8000/sessions/ackdemo/directions/c2s/revisions/1/report
+# "gaps":[[3,5]],"earliest_base64":"QUJDRA=="   ← 报告与定位不随确认证据变化
+```
+
+**纯 SYN/FIN 无载荷也核验 FIN 前缺口**：会话 `pfin` 只有 SYN（seq=2000）与纯 FIN
+（seq=2004 ⇒ `fin_pos=4`），FIN 前 `[1,4)` 全部是缺口。反向证据中
+`ack=2147485649` 相对偏移越过 2^31（**半序号窗口外，整条忽略并计数**），
+`ack=2002` 累计覆盖 `[1,2)`，SACK `[2003,2004)` 覆盖 `[3,4)`，
+`[2,3)` 无确认依据：
+
+```json
+{"revision":1,"isn":2000,"fin_pos":4,"gaps":[[1,4]],
+ "cumulative_ack":{"offset":2,"source":{"packet_id":12,"capture":6,"ack":2002}},
+ "sack_blocks":[{"start":3,"end":4,
+   "sources":[{"packet_id":12,"capture":6,"ack":2002}]}],
+ "acknowledged_gaps":[[1,2],[3,4]],"unacknowledged_gaps":[[2,3]],
+ "ignored_outside_window":1}
+```
+
+**校验错误**：
+
+```bash
+# SACK 无 ACK → 422
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":20,"seq":8000,"sack":[{"left":1004,"right":1005}]}]}'
+# {"detail":{"error":"sack_without_ack","capture":20,
+#            "message":"capture=20 带 SACK 的报文必须同时提供 32 位 ack"}}
+
+# SACK 空块（left==right）→ 422
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":21,"seq":8000,"ack":1004,
+                   "sack":[{"left":1005,"right":1005}]}]}'
+# {"detail":{"error":"invalid_sack","capture":21,
+#            "message":"capture=21 的 SACK 块 [1005,1005) 非法：半开块必须满足 left<right"}}
+
+# 同捕获序号但 ACK 内容不同 → 409
+curl -s -X POST localhost:8000/sessions/ackdemo/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":10,"seq":7000,"syn":true,"ack":1005}]}'
+# {"detail":{"error":"capture_conflict","current_revision":0,
+#            "message":"捕获序号 10 已存在且报文内容不同"}}
+
+# 未知修订 → 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  localhost:8000/sessions/ackdemo/directions/c2s/revisions/9/verify
+# 404
+```
+
+---
+
 ## 5. 工程实现与内存
 
-- **FastAPI + SQLite（WAL）**。报文只做原始入库（含整条内容 SHA-256，用于同 capture 异内容检测），
-  与是否已有 SYN 无关，因此上传顺序无关。
+- **FastAPI + SQLite（WAL）**。报文只做原始入库（含整条内容 SHA-256，覆盖 seq/SYN/FIN/载荷/ACK/SACK，
+  用于同 capture 异内容检测），与是否已有 SYN 无关，因此上传顺序无关；旧库启动时自动补
+  `ack`/`sack` 列并重算摘要，旧格式报文（无 ACK/SACK）继续可用。
 - **发布是单事务**：锚定唯一 ISN → 校验 SYN/FIN/2^31 规则 → 扫描线（最小/最大捕获堆）产出原子行程并
   合并相邻同源行程 → 写入不可变 `revisions` 与 `runs`。载荷始终留在 `packets`，`runs` 仅保存整数区间
   与来源报文引用。
@@ -539,6 +717,11 @@ curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
   一旦相邻 run 之间出现缺口（`next.start > prev.end`）立即 `reset()`，绝不拼接缺口两端；
   两侧命中各自有序，再按同起点归并为 `both / earliest_only / latest_only`。
   扫描只读不可变 run 与原始报文，不复制整版字节流，旧修订的命中不随后续发布变化。
+- **对端确认缺口核验只读不写**（`app/verify.py`）：以修订元数据中的 ISN 为锚，流式扫描反向报文，
+  累计 ACK 取窗口内最大偏移、SACK 块各自换算并合并重叠区间（带来源引用），
+  再与修订冻结缺口做区间交/差。确认集合**请求时重算、不缓存不固化**，
+  因此晚到 ACK/SACK 入库即更新核验；除 `packets` 的 ACK/SACK 原始列外不引入任何可变状态，
+  修订报告与定位天然不受影响。半序号窗口外的 ACK/SACK 直接忽略并计数。
 - 修订与 run 使用 `(session_id, direction, revision)` 复合主键，修订号每方向独立；请求连接短开短关，
   无跨线程共享。
 
@@ -548,12 +731,13 @@ curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
 
 ```
 app/main.py         HTTP 路由 / 错误码映射
-app/schemas.py      请求与响应模型
+app/schemas.py      请求与响应模型（含 ACK/SACK 报文、核验响应）
 app/reassembly.py   相对序号、发布校验、扫描线 earliest/latest 裁决、缺口/完整性
-app/db.py           SQLite 存储、发布事务、run 快照、载荷窗口读取、run 顺序迭代
+app/db.py           SQLite 存储、发布事务、run 快照、载荷窗口读取、run 顺序迭代、旧库迁移
 app/report.py       分页报告构建（缺口不补零、run 内分块、逐字节分歧区间）
 app/search.py       字节特征定位（跨窗口/跨 run 有状态 KMP、缺口截断、双侧归并分页）
+app/verify.py       对端确认缺口核验（反向 ACK/SACK 换算、窗口过滤、区间交/差、来源引用）
 scripts/stress.py   10 万报文 / 20 MiB / 近 2^31 缺口压测
-tests/              35 个单元 + HTTP 端到端测试（含 test_locate.py 12 例）
-docker-compose.yml  一键启动重组 + 字节特征定位服务（命名卷持久化）
+tests/              58 个单元 + HTTP 端到端测试（test_locate.py 12 例、test_verify.py 23 例）
+docker-compose.yml  一键启动重组 + 定位 + 对端确认核验服务（命名卷持久化）
 ```

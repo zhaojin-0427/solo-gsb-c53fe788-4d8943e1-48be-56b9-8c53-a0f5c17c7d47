@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS packets (
     syn         INTEGER NOT NULL,
     fin         INTEGER NOT NULL,
     payload     BLOB NOT NULL,
+    ack         INTEGER,                 -- NULL：旧格式报文无 ACK 字段
+    sack        TEXT NOT NULL DEFAULT '[]',  -- JSON [[l,r],...] 规范化排序后存储
     sha256      TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, direction, capture)
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS packets (
 
 CREATE INDEX IF NOT EXISTS idx_packets_stream
     ON packets(session_id, direction, id);
+
 
 -- 每次成功发布产生一行修订（修订内容不可变）。
 -- revision 号按 (会话, 方向) 独立从 1 递增。
@@ -107,6 +110,67 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_packet_columns(conn)
+
+
+def _migrate_packet_columns(conn: sqlite3.Connection) -> None:
+    """旧库升级：补 ack / sack 列，并用含 ACK/SACK 的新摘要重算 sha256。
+
+    旧格式报文 ack=NULL、sack=[]，与上传时缺省 ACK/SACK 的报文摘要一致，
+    因此升级后旧报文的同 capture 幂等重传仍然成立。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(packets)")}
+    with transaction(conn):
+        if "ack" not in cols:
+            conn.execute("ALTER TABLE packets ADD COLUMN ack INTEGER")
+        if "sack" not in cols:
+            conn.execute(
+                "ALTER TABLE packets ADD COLUMN sack TEXT NOT NULL DEFAULT '[]'"
+            )
+        conn.execute(
+            # 对端确认核验：按 (会话, 反向) 扫描 ACK/SACK 证据
+            "CREATE INDEX IF NOT EXISTS idx_packets_peer_acks"
+            " ON packets(session_id, direction, ack)"
+        )
+        # 旧行的 sha256 仅覆盖 seq/SYN/FIN/载荷，按新算法重算
+        import json
+
+        rows = conn.execute(
+            "SELECT id, seq, syn, fin, payload, ack, sack FROM packets"
+        ).fetchall()
+        for r in rows:
+            digest = packet_digest(
+                r["seq"],
+                r["syn"],
+                r["fin"],
+                bytes(r["payload"] or b""),
+                r["ack"],
+                json.loads(r["sack"] or "[]"),
+            )
+            conn.execute("UPDATE packets SET sha256=? WHERE id=?", (digest, r["id"]))
+
+
+def normalize_sack(sack) -> list[tuple[int, int]]:
+    """SACK 块规范化：按 (left,right) 排序去重，作为摘要与存储的标准形式。"""
+    return sorted({(int(l), int(r)) for l, r in sack})
+
+
+def packet_digest(seq: int, syn: int, fin: int, payload: bytes,
+                  ack: int | None, sack) -> str:
+    """整条报文内容摘要（含 ACK/SACK），同 capture 异内容据此判定 409。"""
+    import json
+
+    h = hashlib.sha256()
+    h.update(seq.to_bytes(4, "little"))
+    h.update(bytes([syn, fin]))
+    h.update(payload)
+    if ack is None:
+        h.update(b"noack")
+    else:
+        h.update(b"ack:")
+        h.update(int(ack).to_bytes(4, "little"))
+    h.update(json.dumps(normalize_sack(sack), separators=(",", ":")).encode())
+    return h.hexdigest()
 
 
 @contextmanager
@@ -146,30 +210,47 @@ def current_revision(conn: sqlite3.Connection, session_id: str, direction: str) 
 
 
 def add_packets(conn: sqlite3.Connection, session_id: str, direction: str, packets) -> None:
-    """批量写入报文。同 (direction, capture) 已存在：内容一致则忽略，冲突则 409。
+    """批量写入报文。同 (direction, capture) 已存在：整条内容一致则忽略，冲突则 409。
 
-    packets: [(capture:int, seq:int, syn:bool, fin:bool, payload:bytes), ...]
+    packets 每项为 (capture, seq, syn, fin, payload) 旧五元组，
+    或 (capture, seq, syn, fin, payload, ack, sack) 七元组
+    （ack: int|None；sack: [[l,r],...]，空列表表示无 SACK）。
     """
+    import json
+
     insert_sql = (
-        "INSERT INTO packets(session_id, direction, capture, seq, syn, fin, payload, sha256)"
-        " VALUES (?,?,?,?,?,?,?,?)"
+        "INSERT INTO packets(session_id, direction, capture, seq, syn, fin,"
+        " payload, ack, sack, sha256) VALUES (?,?,?,?,?,?,?,?,?,?)"
     )
-    # 先做批内重复捕获序号检查（seq/SYN/FIN/载荷任一不同即冲突）
+    # 先做批内重复捕获序号检查（seq/SYN/FIN/载荷/ACK/SACK 任一不同即冲突）
     seen: dict[int, str] = {}
     rows = []
-    for capture, seq, syn, fin, payload in packets:
-        digest = hashlib.sha256(
-            seq.to_bytes(4, "little")
-            + bytes([syn, fin])
-            + payload
-        ).hexdigest()
+    for item in packets:
+        if len(item) == 5:
+            capture, seq, syn, fin, payload = item
+            ack, sack = None, []
+        else:
+            capture, seq, syn, fin, payload, ack, sack = item
+        norm_sack = normalize_sack(sack)
+        digest = packet_digest(seq, syn, fin, payload, ack, norm_sack)
         if capture in seen and seen[capture] != digest:
             raise RevisionConflict(
                 current_revision(conn, session_id, direction) or 0,
                 f"批次内捕获序号 {capture} 出现多次且内容不同",
             )
         seen[capture] = digest
-        rows.append((session_id, direction, capture, seq, syn, fin, payload, digest))
+        rows.append((
+            session_id,
+            direction,
+            capture,
+            seq,
+            syn,
+            fin,
+            payload,
+            ack,
+            json.dumps(norm_sack, separators=(",", ":")),
+            digest,
+        ))
 
     with transaction(conn):
         for row in rows:
@@ -179,7 +260,7 @@ def add_packets(conn: sqlite3.Connection, session_id: str, direction: str, packe
                 (session_id, direction, capture),
             ).fetchone()
             if old is not None:
-                if old["sha256"] != row[7]:
+                if old["sha256"] != row[9]:
                     raise RevisionConflict(
                         current_revision(conn, session_id, direction) or 0,
                         f"捕获序号 {capture} 已存在且报文内容不同",

@@ -1,5 +1,6 @@
 services:
-  # TCP 重组 + 字节特征定位服务（/locate）。同一进程同时提供原有发布/报告接口。
+  # TCP 重组 + 字节特征定位（/locate）+ 对端确认缺口核验（/verify）服务。
+  # 同一进程同时提供原有上传/发布/报告接口。
   tcp-reassembly:
     build: .
     image: tcp-reassembly:latest

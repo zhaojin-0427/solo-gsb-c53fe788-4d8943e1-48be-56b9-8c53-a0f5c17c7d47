@@ -207,13 +207,17 @@ def runs_complete(runs: list[dict], fin_pos: int | None) -> bool:
 
 
 def gap_intervals(runs: list[dict], fin_pos: int | None):
-    """缺口区间。FIN 存在时只报告 FIN 之前；否则报告已覆盖跨度内的缺口。"""
-    if not runs:
+    """缺口区间。FIN 存在时只报告 FIN 之前；否则报告已覆盖跨度内的缺口。
+
+    纯 SYN/FIN 无任何数据行程时：FIN 位于 fin_pos（>1，如纯 FIN 报文），
+    FIN 之前 [1, fin_pos) 全部未捕获，仍是需要核验的缺口。
+    """
+    if fin_pos is not None:
+        horizon = fin_pos
+    elif runs:
+        horizon = max(r["end"] for r in runs)
+    else:
         return []
-    data_runs = [r for r in runs if r["end"] > 1]
-    if not data_runs:
-        return []
-    horizon = fin_pos if fin_pos is not None else max(r["end"] for r in runs)
     gaps: list[list[int]] = []
     cursor = 1
     for r in runs:
