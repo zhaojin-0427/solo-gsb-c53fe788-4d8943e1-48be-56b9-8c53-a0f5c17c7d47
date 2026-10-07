@@ -1,0 +1,17 @@
+services:
+  # TCP 重组 + 字节特征定位服务（/locate）。同一进程同时提供原有发布/报告接口。
+  tcp-reassembly:
+    build: .
+    image: tcp-reassembly:latest
+    container_name: tcp-reassembly
+    ports:
+      - "8000:8000"
+    volumes:
+      - tcp-data:/data
+    environment:
+      # SQLite 数据库文件位置；数据保存在命名卷中，重启不丢失
+      DB_PATH: /data/reassembly.db
+    restart: unless-stopped
+
+volumes:
+  tcp-data:
