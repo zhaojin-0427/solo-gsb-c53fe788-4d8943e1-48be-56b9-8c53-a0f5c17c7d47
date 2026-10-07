@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, conint
+from pydantic import BaseModel, Field
 
 Direction = Literal["c2s", "s2c"]
+
+SeqNo = Annotated[int, Field(ge=0, le=0xFFFFFFFF, description="32 位 TCP 序号")]
 
 
 class CreateSessionRequest(BaseModel):
@@ -29,6 +31,14 @@ class PacketIn(BaseModel):
     syn: bool = False
     fin: bool = False
     payload: str = Field(default="", description="Base64 编码的载荷（可为空字符串）")
+    ack: SeqNo | None = Field(
+        default=None,
+        description="可选：32 位确认号（累计 ACK）；缺省表示报文不带 ACK",
+    )
+    sack: list[tuple[SeqNo, SeqNo]] | None = Field(
+        default=None,
+        description="可选：SACK 半开块 [[left,right),...]（32 位序号）；携带时必须有 ack",
+    )
 
 
 class UploadRequest(BaseModel):
@@ -124,3 +134,33 @@ class LocatePage(BaseModel):
     hits: list[PatternHit]
     next_offset: int | None
     done: bool
+
+
+class VerifyEvidence(BaseModel):
+    kind: Literal["ack", "sack"] = Field(
+        description="累计 ACK 覆盖 [1,确认偏移) / SACK 半开块只覆盖块本身"
+    )
+    start: int = Field(description="确认区间起点（目标方向逻辑偏移，含）")
+    end: int = Field(description="确认区间末端（不含）")
+    packet_id: int = Field(description="来源报文内部 id（反方向）")
+    capture: int = Field(description="来源报文捕获序号")
+
+
+class GapVerifyResponse(BaseModel):
+    session_id: str
+    direction: Direction = Field(description="被核验的数据方向")
+    revision: int
+    isn: int
+    fin_pos: int | None
+    complete: bool
+    evidence_direction: Direction = Field(description="确认证据来源方向（对端）")
+    gaps: list[list[int]] = Field(description="该修订冻结的缺口区间 [start,end)")
+    acknowledged_but_missing: list[list[int]] = Field(
+        description="缺口中已被对端 ACK/SACK 确认、但本方向未捕获字节的区间"
+    )
+    no_evidence: list[list[int]] = Field(
+        description="缺口中无任何确认依据的区间（不等于未送达，只是无证据）"
+    )
+    evidence: list[VerifyEvidence] = Field(
+        description="请求时已入库、落在半序号窗口内的全部确认区间及来源引用"
+    )

@@ -8,6 +8,11 @@
 在其中定位任意 Base64 字节特征，返回按逻辑偏移排序的命中起点、下一页起点和
 `both / earliest_only / latest_only` 双侧命中类别，支持重叠命中与跨 run 命中。
 
+还提供**对端确认缺口核验 API**（`GET .../revisions/{rev}/ack-verify`）：报文可携带 32 位
+**ACK** 与 **SACK 半开块**，核验时以目标修订的 SYN 锚（ISN）换算**请求时已入库**的反方向
+确认证据，与该修订冻结的缺口相交，返回**“已确认但未捕获”**与**“无确认依据”**两段区间划分
+（后者不等于未送达，只是没有确认依据）。
+
 报文可以**任意乱序上传**（先传数据、后传 SYN 也可以），结果只取决于全部报文的内容，与上传顺序无关。
 
 ---
@@ -35,7 +40,7 @@ DB_PATH=./data/reassembly.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试与压测
 
 ```bash
-python3 -m pytest -q            # 35 个功能/HTTP 测试（含字节特征定位 12 例）
+python3 -m pytest -q            # 49 个功能/HTTP 测试（含字节特征定位 12 例、确认核验 14 例）
 python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口的内存压测
 ```
 
@@ -75,8 +80,26 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
   不一致返回 **409**，并在 `current_revision` 中给出**当前修订号**。
 - **更晚到达、但 capture 更小的报文**：发布后产生一个**继承全部旧报文**的新修订（新数据并入重算），
   **旧修订报告保持不变**。
-- 同一方向同一 `capture` 的报文若再次上传：整条内容（seq/SYN/FIN/载荷）一致则幂等忽略；
-  任一不同则 **409 capture_conflict**。
+- 同一方向同一 `capture` 的报文若再次上传：整条内容（seq/SYN/FIN/载荷/ACK/SACK）一致则幂等忽略；
+  任一不同则 **409 capture_conflict**（SACK 块顺序不影响内容同一性）。
+
+### 对端确认缺口核验（ack-verify）
+
+- 报文可额外携带 `ack`（32 位确认号）与 `sack`（`[[left,right),...]` 半开块，32 位序号）；
+  **旧格式报文（无这两个字段）照常可用**。携带 `sack` 时必须同时携带 `ack`，否则 **422**；
+  字段非法（空块 `left==right`、块长度不为 2、序号越出 32 位等）同样 **422**。
+- 核验对象是**某方向某修订冻结的缺口**（纯 SYN/FIN 无载荷时即 FIN 之前的缺口）；
+  证据来自**反方向**报文中的 ACK/SACK（核验 `c2s` 用 `s2c` 的确认，反之亦然）。
+- 换算锚是**目标修订的 ISN**：累计 ACK 确认偏移 `ack_off = (ack - isn) mod 2^32`，
+  覆盖 `[1, ack_off)`；SACK **只覆盖各半开块本身**，块上界绝不当作累计确认。
+  落在半序号窗口（2^31）之外的确认一律忽略。
+- 重复或倒序的 ACK、相互重叠的 SACK 块**不重复计数**：全部确认区间先取并集，再与缺口相交。
+- 结果把缺口划分为 `acknowledged_but_missing`（对端已确认、本方向未捕获）与
+  `no_evidence`（无确认依据；**不等于未送达**），并附 `evidence` 明细（每条确认区间及其
+  来源报文 `packet_id`/`capture`）。
+- 发布只把**字节覆盖与来源引用**固化为 run，缺口随修订冻结；确认集合**请求时重算**，
+  因此晚到的 ACK/SACK 证据会反映在下一次核验里，而旧修订的缺口、报告与定位结果不变。
+  未知修订（含 `latest` 但从未发布）返回 **404**。
 
 ---
 
@@ -92,6 +115,7 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}` | 修订元信息（`rev` 可为整数或 `latest`） |
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}/report` | 分页重组报告 |
 | POST | `/sessions/{id}/directions/{dir}/revisions/{rev}/locate` | 字节特征定位（跨 run、双侧分类、分页） |
+| GET | `/sessions/{id}/directions/{dir}/revisions/{rev}/ack-verify` | 对端确认缺口核验（ACK/SACK 证据 ∩ 冻结缺口） |
 
 `{dir}` ∈ `c2s`、`s2c`。报告查询参数：`offset`（默认 1，∈[1,2^31]）、
 `max_bytes`（默认 65536，硬上限 4 MiB）、`max_runs`（默认 2000，硬上限 20000）。
@@ -129,10 +153,12 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
 报文对象：
 
 ```json
-{ "capture": 2, "seq": 1001, "syn": false, "fin": false, "payload": "QUI=" }
+{ "capture": 2, "seq": 1001, "syn": false, "fin": false, "payload": "QUI=",
+  "ack": 1006, "sack": [[1008, 1010]] }
 ```
 
-`payload` 为标准 Base64（空载荷用 `""`）。非法 Base64 返回 422。
+`payload` 为标准 Base64（空载荷用 `""`），非法 Base64 返回 422。
+`ack` / `sack` 均可省略（旧格式）；`sack` 为 32 位序号的半开块列表，携带时 `ack` 必填。
 
 ---
 
@@ -522,12 +548,100 @@ curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
 修订 2 / CDE: {"hits":[{"offset":3,"category":"both"}],"done":true}
 ```
 
+### 4.8 对端确认缺口核验：ACK/SACK ∩ 冻结缺口
+
+会话 `vk`，c2s 方向 ISN=1000：`AB` 在偏移 [1,3)，`CD` 在 [10,12)，缺口 `[3,10)`：
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' \
+  -d '{"session_id":"vk"}'
+curl -s -X POST localhost:8000/sessions/vk/directions/c2s/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":1,"seq":1000,"syn":true},
+                  {"capture":2,"seq":1001,"payload":"QUI="},
+                  {"capture":3,"seq":1010,"payload":"Q0Q="}]}'
+curl -s -X POST localhost:8000/sessions/vk/directions/c2s/revisions \
+  -H 'Content-Type: application/json' -d '{"expected_revision":0}'
+```
+```json
+{"session_id":"vk","direction":"c2s","revision":1,"current_revision":1,
+ "isn":1000,"fin_pos":null,"complete":false,"run_count":2,"gaps":[[3,10]]}
+```
+
+尚无确认证据时核验，整个缺口都是 `no_evidence`：
+
+```bash
+curl -s localhost:8000/sessions/vk/directions/c2s/revisions/1/ack-verify
+```
+```json
+{"session_id":"vk","direction":"c2s","revision":1,"isn":1000,"fin_pos":null,
+ "complete":false,"evidence_direction":"s2c","gaps":[[3,10]],
+ "acknowledged_but_missing":[],"no_evidence":[[3,10]],"evidence":[]}
+```
+
+上传**反方向**（s2c）的确认报文：capture=1 带累计 ACK `ack=1006`（确认偏移 6，覆盖 `[1,6)`），
+capture=2 重复同一 ACK 并附 SACK 块 `[1008,1010)`（只覆盖 `[8,10)`；重复 ACK 不重复计数）：
+
+```bash
+curl -s -X POST localhost:8000/sessions/vk/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":1,"seq":9000,"ack":1006},
+                  {"capture":2,"seq":9001,"ack":1006,"sack":[[1008,1010]]}]}'
+```
+```json
+{"session_id":"vk","direction":"s2c","accepted":2,"current_revision":0}
+```
+
+确认集合**请求时重算**，无需重新发布，再次核验即反映晚到证据：缺口 `[3,10)` 被划分为
+已确认但未捕获的 `[3,6)`、`[8,10)` 与无确认依据的 `[6,8)`；`evidence` 给出每条确认区间的
+来源报文（注意 SACK 上界 1010 没有被当作累计确认，否则 `[6,8)` 会被误判为已确认）：
+
+```bash
+curl -s localhost:8000/sessions/vk/directions/c2s/revisions/1/ack-verify
+```
+```json
+{"session_id":"vk","direction":"c2s","revision":1,"isn":1000,"fin_pos":null,
+ "complete":false,"evidence_direction":"s2c","gaps":[[3,10]],
+ "acknowledged_but_missing":[[3,6],[8,10]],"no_evidence":[[6,8]],
+ "evidence":[
+   {"kind":"ack","start":1,"end":6,"packet_id":4,"capture":1},
+   {"kind":"ack","start":1,"end":6,"packet_id":5,"capture":2},
+   {"kind":"sack","start":8,"end":10,"packet_id":5,"capture":2}]}
+```
+
+错误码：**SACK 无 ACK → 422**；**同捕获序号异确认内容 → 409**；**未知修订 → 404**：
+
+```bash
+curl -s -X POST localhost:8000/sessions/vk/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":3,"seq":9002,"sack":[[1008,1010]]}]}'
+```
+```json
+{"detail":{"error":"sack_without_ack","capture":3,
+           "message":"capture=3 携带 SACK 块但缺少 ack 字段"}}
+```
+```bash
+curl -s -X POST localhost:8000/sessions/vk/directions/s2c/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":1,"seq":9000,"ack":1007}]}'
+```
+```json
+{"detail":{"error":"capture_conflict","current_revision":0,
+           "message":"捕获序号 1 已存在且报文内容不同"}}
+```
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  localhost:8000/sessions/vk/directions/c2s/revisions/9/ack-verify
+# 404
+```
+
 ---
 
 ## 5. 工程实现与内存
 
-- **FastAPI + SQLite（WAL）**。报文只做原始入库（含整条内容 SHA-256，用于同 capture 异内容检测），
-  与是否已有 SYN 无关，因此上传顺序无关。
+- **FastAPI + SQLite（WAL）**。报文只做原始入库（含整条内容 SHA-256，用于同 capture 异内容检测；
+  哈希涵盖 ACK/SACK，且对无确认内容的报文与旧版算法逐字节一致，旧库重传安全），
+  与是否已有 SYN 无关，因此上传顺序无关。旧库首次启动时自动 `ALTER TABLE` 补 `ack`/`sack` 列。
 - **发布是单事务**：锚定唯一 ISN → 校验 SYN/FIN/2^31 规则 → 扫描线（最小/最大捕获堆）产出原子行程并
   合并相邻同源行程 → 写入不可变 `revisions` 与 `runs`。载荷始终留在 `packets`，`runs` 仅保存整数区间
   与来源报文引用。
@@ -539,6 +653,10 @@ curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
   一旦相邻 run 之间出现缺口（`next.start > prev.end`）立即 `reset()`，绝不拼接缺口两端；
   两侧命中各自有序，再按同起点归并为 `both / earliest_only / latest_only`。
   扫描只读不可变 run 与原始报文，不复制整版字节流，旧修订的命中不随后续发布变化。
+- **对端确认核验不固化确认集合**：`app/verify.py` 在请求时读取反方向全部 ACK/SACK 报文，
+  以目标修订的 ISN 换算确认区间（累计 ACK → `[1,确认偏移)`；SACK → 各半开块本身），
+  取并集后与该修订冻结的 `gaps` 求交/求差。缺口随修订不可变，晚到的确认证据
+  自然反映在下一次核验结果中；报告与定位路径不受影响。
 - 修订与 run 使用 `(session_id, direction, revision)` 复合主键，修订号每方向独立；请求连接短开短关，
   无跨线程共享。
 
@@ -553,7 +671,8 @@ app/reassembly.py   相对序号、发布校验、扫描线 earliest/latest 裁�
 app/db.py           SQLite 存储、发布事务、run 快照、载荷窗口读取、run 顺序迭代
 app/report.py       分页报告构建（缺口不补零、run 内分块、逐字节分歧区间）
 app/search.py       字节特征定位（跨窗口/跨 run 有状态 KMP、缺口截断、双侧归并分页）
+app/verify.py       对端确认缺口核验（ACK/SACK 换算、区间并集、缺口相交划分）
 scripts/stress.py   10 万报文 / 20 MiB / 近 2^31 缺口压测
-tests/              35 个单元 + HTTP 端到端测试（含 test_locate.py 12 例）
-docker-compose.yml  一键启动重组 + 字节特征定位服务（命名卷持久化）
+tests/              49 个单元 + HTTP 端到端测试（含 test_locate.py 12 例、test_verify.py 14 例）
+docker-compose.yml  一键启动重组 + 字节特征定位 + 确认核验服务（命名卷持久化）
 ```

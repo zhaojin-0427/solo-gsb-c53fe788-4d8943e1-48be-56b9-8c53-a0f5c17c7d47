@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS packets (
     syn         INTEGER NOT NULL,
     fin         INTEGER NOT NULL,
     payload     BLOB NOT NULL,
+    ack         INTEGER,               -- 32 位确认号；NULL 表示报文不带 ACK
+    sack        TEXT,                  -- JSON [[l,r],...] 半开块；NULL 表示无 SACK
     sha256      TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, direction, capture)
@@ -107,6 +110,16 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_packets(conn)
+
+
+def _migrate_packets(conn: sqlite3.Connection) -> None:
+    """旧库升级：packets 表补 ack / sack 列（既有行均为 NULL = 无确认内容）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(packets)")}
+    if "ack" not in cols:
+        conn.execute("ALTER TABLE packets ADD COLUMN ack INTEGER")
+    if "sack" not in cols:
+        conn.execute("ALTER TABLE packets ADD COLUMN sack TEXT")
 
 
 @contextmanager
@@ -145,31 +158,60 @@ def current_revision(conn: sqlite3.Connection, session_id: str, direction: str) 
     return row["m"]
 
 
+def _packet_digest(seq: int, syn: int, fin: int, payload: bytes,
+                   ack: int | None, sack_norm) -> str:
+    """报文内容哈希。无 ACK/SACK 时与旧版算法逐字节一致（旧库幂等重传安全）。"""
+    h = hashlib.sha256(
+        seq.to_bytes(4, "little")
+        + bytes([syn, fin])
+        + payload
+    )
+    if ack is not None:
+        h.update(b"\x01" + ack.to_bytes(4, "little"))
+    if sack_norm:
+        h.update(b"\x02" + json.dumps(sack_norm, separators=(",", ":")).encode("ascii"))
+    return h.hexdigest()
+
+
+def _normalize_sack(sack) -> list | None:
+    """SACK 块规范化：排序后块顺序不影响内容同一性；空列表视为无 SACK。"""
+    if not sack:
+        return None
+    return sorted([int(b[0]), int(b[1])] for b in sack)
+
+
 def add_packets(conn: sqlite3.Connection, session_id: str, direction: str, packets) -> None:
     """批量写入报文。同 (direction, capture) 已存在：内容一致则忽略，冲突则 409。
 
-    packets: [(capture:int, seq:int, syn:bool, fin:bool, payload:bytes), ...]
+    packets: [(capture, seq, syn, fin, payload), ...] 旧格式，或
+             [(capture, seq, syn, fin, payload, ack, sack), ...]；
+             ack 为 32 位确认号或 None，sack 为 [(l, r), ...] 半开块或 None。
+    内容哈希涵盖 ACK/SACK：同捕获序号但确认内容不同同样判 409。
     """
     insert_sql = (
-        "INSERT INTO packets(session_id, direction, capture, seq, syn, fin, payload, sha256)"
-        " VALUES (?,?,?,?,?,?,?,?)"
+        "INSERT INTO packets(session_id, direction, capture, seq, syn, fin, payload,"
+        " ack, sack, sha256) VALUES (?,?,?,?,?,?,?,?,?,?)"
     )
-    # 先做批内重复捕获序号检查（seq/SYN/FIN/载荷任一不同即冲突）
+    # 先做批内重复捕获序号检查（seq/SYN/FIN/载荷/ACK/SACK 任一不同即冲突）
     seen: dict[int, str] = {}
     rows = []
-    for capture, seq, syn, fin, payload in packets:
-        digest = hashlib.sha256(
-            seq.to_bytes(4, "little")
-            + bytes([syn, fin])
-            + payload
-        ).hexdigest()
+    for pkt in packets:
+        capture, seq, syn, fin, payload = pkt[:5]
+        ack = pkt[5] if len(pkt) > 5 else None
+        sack_norm = _normalize_sack(pkt[6] if len(pkt) > 6 else None)
+        digest = _packet_digest(seq, syn, fin, payload, ack, sack_norm)
         if capture in seen and seen[capture] != digest:
             raise RevisionConflict(
                 current_revision(conn, session_id, direction) or 0,
                 f"批次内捕获序号 {capture} 出现多次且内容不同",
             )
         seen[capture] = digest
-        rows.append((session_id, direction, capture, seq, syn, fin, payload, digest))
+        rows.append((
+            session_id, direction, capture, seq, syn, fin, payload,
+            ack,
+            json.dumps(sack_norm, separators=(",", ":")) if sack_norm else None,
+            digest,
+        ))
 
     with transaction(conn):
         for row in rows:
@@ -179,13 +221,23 @@ def add_packets(conn: sqlite3.Connection, session_id: str, direction: str, packe
                 (session_id, direction, capture),
             ).fetchone()
             if old is not None:
-                if old["sha256"] != row[7]:
+                if old["sha256"] != row[9]:
                     raise RevisionConflict(
                         current_revision(conn, session_id, direction) or 0,
                         f"捕获序号 {capture} 已存在且报文内容不同",
                     )
                 continue  # 幂等重传
             conn.execute(insert_sql, row)
+
+
+def iter_ack_packets(conn: sqlite3.Connection, session_id: str, direction: str):
+    """按捕获序号升序取该方向所有带 ACK 或 SACK 的报文（对端确认证据）。"""
+    return conn.execute(
+        "SELECT id, capture, ack, sack FROM packets"
+        " WHERE session_id=? AND direction=?"
+        " AND (ack IS NOT NULL OR sack IS NOT NULL) ORDER BY capture",
+        (session_id, direction),
+    ).fetchall()
 
 
 # ---------------- 发布修订 ----------------
@@ -276,8 +328,6 @@ def publish_revision(
         gaps = gap_intervals(merged, fin_pos)
         complete = runs_complete(merged, fin_pos)
 
-        import json
-
         new_revision = (cur or 0) + 1
         conn.execute(
             "INSERT INTO revisions(session_id, direction, revision, isn, fin_pos,"
@@ -345,7 +395,6 @@ def get_revision_meta(conn: sqlite3.Connection, session_id: str, direction: str,
     ).fetchone()
     if row is None:
         return None
-    import json
 
     return {
         "revision": row["revision"],
